@@ -185,8 +185,8 @@ class RecurrentDecoder(Decoder):
         :param prev_att_vector:
         """
         assert len(encoder_output.shape) == 3
-        assert len(encoder_hidden.shape) == 2
-        assert encoder_hidden.shape[-1] == encoder_output.shape[-1]
+        #assert len(encoder_hidden.shape) == 2
+        #assert encoder_hidden.shape[-1] == encoder_output.shape[-1]
         assert src_mask.shape[1] == 1
         assert src_mask.shape[0] == encoder_output.shape[0]
         assert src_mask.shape[2] == encoder_output.shape[1]
@@ -341,7 +341,7 @@ class RecurrentDecoder(Decoder):
 
         # initialize decoder hidden state from final encoder hidden state
         if hidden is None:
-            hidden = self._init_hidden(encoder_hidden)
+            hidden = self._init_hidden(encoder_hidden, batch_size = encoder_output.size(0))
 
         # pre-compute projected encoder outputs
         # (the "keys" for the attention mechanism)
@@ -380,7 +380,7 @@ class RecurrentDecoder(Decoder):
         # outputs: batch, unroll_steps, vocab_size
         return outputs, hidden, att_probs, att_vectors
 
-    def _init_hidden(self, encoder_final: Tensor = None) \
+    def _init_hidden(self, encoder_final: Tensor = None, batch_size = 0) \
             -> (Tensor, Optional[Tensor]):
         """
         Returns the initial decoder state,
@@ -407,7 +407,7 @@ class RecurrentDecoder(Decoder):
         :return: hidden state if GRU, (hidden state, memory cell) if LSTM,
             shape (batch_size, hidden_size)
         """
-        batch_size = encoder_final.size(0)
+        batch_size = encoder_final.size(0) if encoder_final else batch_size
 
         # for multiple layers: is the same for all layers
         if self.init_hidden_option == "bridge" and encoder_final is not None:
@@ -422,8 +422,9 @@ class RecurrentDecoder(Decoder):
             hidden = encoder_final.unsqueeze(0).repeat(self.num_layers, 1, 1)
         else:  # initialize with zeros
             with torch.no_grad():
-                hidden = encoder_final.new_zeros(
-                    self.num_layers, batch_size, self.hidden_size)
+                #hidden = encoder_final.new_zeros(
+                 #   self.num_layers, batch_size, self.hidden_size)
+                hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size).cuda()    
 
         return (hidden, hidden) if isinstance(self.rnn, nn.LSTM) else hidden
 
