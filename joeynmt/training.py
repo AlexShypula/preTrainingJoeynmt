@@ -28,7 +28,7 @@ from joeynmt.helpers import log_data_info, load_config, log_cfg, \
 from joeynmt.model import Model
 from joeynmt.prediction import validate_on_data
 from joeynmt.loss import XentLoss
-from joeynmt.data import load_data, make_data_iter
+from joeynmt.data import load_data, make_data_iter, ShardedEpochDatasetIterator, shard_data
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
@@ -47,6 +47,7 @@ class TrainManager:
         :param config: dictionary containing the training configurations
         """
         train_config = config["training"]
+        data_config = config["data"]
 
         # files for logging and storing
         self.model_dir = make_model_dir(train_config["model_dir"],
@@ -57,6 +58,10 @@ class TrainManager:
         self.valid_report_file = "{}/validations.txt".format(self.model_dir)
         self.tb_writer = SummaryWriter(
             log_dir=self.model_dir + "/tensorboard/")
+
+        # sharding (currently not needed)
+        # self.n_shards = data_config.get("n_shards", None)
+        # self.percent_to_sample_from_shard = data_config.get("percent_to_sample_from_shard", 1.0)
 
         # model
         self.model = model
@@ -267,7 +272,8 @@ class TrainManager:
     # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
-    def train_and_validate(self, train_data: Dataset, valid_data: Dataset) \
+    def train_and_validate(self, train_data: Dataset, valid_data: Dataset,
+                           sharded_iterator: ShardedEpochDatasetIterator = None) \
             -> None:
         """
         Train the model and validate it from time to time on the validation set.
@@ -275,17 +281,38 @@ class TrainManager:
         :param train_data: training data
         :param valid_data: validation data
         """
-        train_iter = make_data_iter(train_data,
-                                    batch_size=self.batch_size,
-                                    batch_type=self.batch_type,
-                                    train=True, shuffle=self.shuffle)
+
+
+        if not train_data:
+            assert sharded_iterator, "if there is no train_data, there must be a sharded iterator"
+            load_sharded_dataset = True
+
+
+        else:
+            train_iter = make_data_iter(train_data,
+                                        batch_size=self.batch_size,
+                                        batch_type=self.batch_type,
+                                        train=True, shuffle=self.shuffle)
+            load_sharded_dataset = False
+
 
         # For last batch in epoch batch_multiplier needs to be adjusted
         # to fit the number of leftover training examples
-        leftover_batch_size = len(
-            train_data) % (self.batch_multiplier * self.batch_size)
+
 
         for epoch_no in range(self.epochs):
+
+            if load_sharded_dataset:
+                # if sharded training, load a new dataset from shards
+                train_data = next(sharded_iterator)
+                train_iter = make_data_iter(train_data,
+                                            batch_size=self.batch_size,
+                                            batch_type=self.batch_type,
+                                            train=True, shuffle=self.shuffle)
+
+            leftover_batch_size = len(
+                train_data) % (self.batch_multiplier * self.batch_size)
+
             self.logger.info("EPOCH %d", epoch_no + 1)
 
             if self.scheduler is not None and self.scheduler_step_at == "epoch":
@@ -622,9 +649,34 @@ def train(cfg_file: str) -> None:
     # set the random seed
     set_seed(seed=cfg["training"].get("random_seed", 42))
 
+
+    if cfg["data"].get("shard_data", False):
+        assert cfg["data"].get("n_shards",0) > 0, "n_shards needs to exist and be at least 1"
+        shard_data(path=cfg["data"]["train"],
+                   src_lang=cfg["data"]["src"],
+                   tgt_lang=cfg["data"]["trg"],
+                   n_shards=cfg["data"]["n_shards"])
+
     # load the data
-    train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
-        data_cfg=cfg["data"])
+    load_train_whole = True if cfg["data"].get("n_shards", 0) < 1 else False
+    train_data, dev_data, test_data, src_vocab, trg_vocab, src_field, trg_field = load_data(
+        data_cfg=cfg["data"], load_train=load_train_whole)
+
+    if not load_train_whole:
+        sharded_iterator = ShardedEpochDatasetIterator(n_shards=cfg["data"]["n_shards"],
+                                                       percent_to_sample=cfg["data"].get("percent_to_sample_from_shard",
+                                                                                         1.0),
+                                                       data_path=cfg["data"]["train"],
+                                                       extensions=(cfg["data"]["src"], cfg["data"]["trg"]),
+                                                       fields=(src_field, trg_field),
+                                                       n_epochs=cfg["training"]["epochs"],
+                                                       filter_pred=lambda x: len(vars(x)['src'])
+                                                                 <= cfg["data"]["max_sent_length"]
+                                                                 and len(vars(x)['trg'])
+                                                                 <= cfg["data"]["max_sent_length"]
+                                                       )
+    else:
+        sharded_iterator = None
 
     # build an encoder-decoder model
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
@@ -651,7 +703,7 @@ def train(cfg_file: str) -> None:
     trg_vocab.to_file(trg_vocab_file)
 
     # train the model
-    trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
+    trainer.train_and_validate(train_data=train_data, valid_data=dev_data, sharded_iterator = sharded_iterator)
 
     # predict with the best model on validation and test
     # (if test data is available)
