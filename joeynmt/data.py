@@ -19,14 +19,14 @@ from joeynmt.vocabulary import build_vocab, Vocabulary
 
 from concurrent.futures import ThreadPoolExecutor
 
-def shard_data(path: str, src_lang: str, tgt_lang: str, n_shards: int):
+def shard_data(path: str, shard_path: str, src_lang: str, tgt_lang: str, n_shards: int):
     # nota bene: src_lang and tgt lang are the suffixes, and path is the prefix
     indexes = [i for i in range(n_shards)]
     new_src_paths = []
     new_tgt_paths = []
     for i in indexes:
-        new_src_paths.append(path + "_{}.".format(i) + src_lang)
-        new_tgt_paths.append(path + "_{}.".format(i) + tgt_lang)
+        new_src_paths.append(shard_path + "_{}.".format(i) + src_lang)
+        new_tgt_paths.append(shard_path + "_{}.".format(i) + tgt_lang)
     for p in new_src_paths + new_tgt_paths:
         assert not os.path.exists(p), f"path: {p} already exists"
     src_fhs = [open(f, mode = "w", encoding="utf-8") for f in new_src_paths]
@@ -36,7 +36,7 @@ def shard_data(path: str, src_lang: str, tgt_lang: str, n_shards: int):
     with open(path + "." + src_lang, mode = "r", encoding = "utf-8") as src_fh, \
             open(path + "." + tgt_lang, mode = "r", encoding = "utf-8") as tgt_fh:
         for src_line, tgt_line in zip(src_fh, tgt_fh):
-            i = random.sample(indexes)[0]
+            i = random.sample(indexes, 1)[0]
             src_fhs[i].write(src_line)
             tgt_fhs[i].write(tgt_line)
             pbar.update(1)
@@ -46,12 +46,14 @@ def shard_data(path: str, src_lang: str, tgt_lang: str, n_shards: int):
 
 class ShardedEpochDatasetIterator:
     def __init__(self, n_shards: int, percent_to_sample: float,
-                 data_path: str, extensions: Tuple[str], fields: Tuple[Field], n_threads = 4, n_epochs = 1, **kwargs):
+            data_path: str, shard_path: str, extensions: Tuple[str], fields: Tuple[Field], n_threads = 4, n_epochs = 1, **kwargs):
         assert percent_to_sample <= 1.0 and percent_to_sample >= 0.0, "percent to sample needs to be between 0 and 1"
         self.fields = fields
+        if not isinstance(self.fields[0], (tuple, list)): 
+            self.fields = [("src", fields[0]), ("trg", fields[1])]
         self.n_threads = n_threads
-        self.src_shards_paths = [data_path + "_{}".format(i) + extensions[0] for i in range(n_shards)]
-        self.tgt_shards_paths = [data_path + "_{}".format(i) + extensions[1] for i in range(n_shards)]
+        self.src_shards_paths = [shard_path + "_{}.".format(i) + extensions[0] for i in range(n_shards)]
+        self.tgt_shards_paths = [shard_path + "_{}.".format(i) + extensions[1] for i in range(n_shards)]
         for p in self.src_shards_paths + self.tgt_shards_paths:
             assert os.path.exists(p), "uh oh, the sharded data is not available at path {}".format(p)
         self.percent_to_sample = percent_to_sample
@@ -70,7 +72,7 @@ class ShardedEpochDatasetIterator:
         return self
 
     def __next__(self):
-        if self.current_epoch < self.n_epochs
+        if self.current_epoch < self.n_epochs: 
             self.current_epoch+=1
             return self._get_dataset()
         else:
@@ -80,12 +82,13 @@ class ShardedEpochDatasetIterator:
     def _get_dataset(self):
         examples = []
         pbar = tqdm(total = len(self.get_dataset_kwarg_list), desc = "loading in the sharded data")
-        for examples_shard in self.pool.map(self._read_and_sample_wapper, self.get_dataset_kwarg_list):
+        for examples_shard in self.pool.map(self._read_and_sample_wrapper, self.get_dataset_kwarg_list):
             examples.extend([
                 data.Example.fromlist([src_line.strip(), tgt_line.strip()], self.fields)
                 for src_line, tgt_line in examples_shard]
                             )
             pbar.update(1)
+            del examples_shard
 
         return data.Dataset(examples, self.fields, **self.kwargs)
 
@@ -93,15 +96,17 @@ class ShardedEpochDatasetIterator:
         return self._read_and_sample(**kwargs)
 
     def _read_and_sample(self, src_path: str, tgt_path: str, percent_to_sample: float):
-        with open(src_path, mode = "r", encoding = "utf-8") as src_fh,
+        with open(src_path, mode = "r", encoding = "utf-8") as src_fh, \
             open(tgt_path, mode = "r", encoding = "utf-8") as tgt_fh:
             src_lines = src_fh.readlines()
-            tgt_lines = tgt_fh.readines()
+            tgt_lines = tgt_fh.readlines()
 
-        line_pairs = zip(src_lines, tgt_lines)
+        line_pairs = list(zip(src_lines, tgt_lines))
         random.shuffle(line_pairs)
         n_samples = math.ceil(percent_to_sample * len(line_pairs))
-        return line_pairs[:n_samples]
+        result = line_pairs[:n_samples]
+        del line_pairs
+        return result
 
 
 def load_data(data_cfg: dict, load_train = True) -> (Dataset, Dataset, Optional[Dataset],
@@ -190,14 +195,24 @@ def load_data(data_cfg: dict, load_train = True) -> (Dataset, Dataset, Optional[
 
     dev_data = TranslationDataset(path=dev_path,
                                   exts=("." + src_lang, "." + trg_lang),
-                                  fields=(src_field, trg_field))
+                                  fields=(src_field, trg_field), 
+                                    filter_pred=
+                                    lambda x: len(vars(x)['src'])
+                                    <= max_sent_length
+                                    and len(vars(x)['trg'])
+                                    <= max_sent_length)
     test_data = None
     if test_path is not None:
         # check if target exists
         if os.path.isfile(test_path + "." + trg_lang):
             test_data = TranslationDataset(
                 path=test_path, exts=("." + src_lang, "." + trg_lang),
-                fields=(src_field, trg_field))
+                fields=(src_field, trg_field), 
+                filter_pred=
+                lambda x: len(vars(x)['src'])
+                <= max_sent_length
+                and len(vars(x)['trg'])
+                <= max_sent_length)
         else:
             # no target is given -> create dataset from src only
             test_data = MonoDataset(path=test_path, ext="." + src_lang,

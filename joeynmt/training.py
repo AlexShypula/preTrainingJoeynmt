@@ -33,6 +33,7 @@ from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
 
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # pylint: disable=too-many-instance-attributes
 class TrainManager:
@@ -648,14 +649,17 @@ def train(cfg_file: str) -> None:
 
     # set the random seed
     set_seed(seed=cfg["training"].get("random_seed", 42))
-
+    shards_dir = os.path.dirname(cfg["data"]["shard_path"])
+    if not os.path.exists(shards_dir): 
+        os.makedirs(shards_dir)
 
     if cfg["data"].get("shard_data", False):
         assert cfg["data"].get("n_shards",0) > 0, "n_shards needs to exist and be at least 1"
         shard_data(path=cfg["data"]["train"],
                    src_lang=cfg["data"]["src"],
                    tgt_lang=cfg["data"]["trg"],
-                   n_shards=cfg["data"]["n_shards"])
+                   n_shards=cfg["data"]["n_shards"], 
+                   shard_path=cfg["data"]["shard_path"])
 
     # load the data
     load_train_whole = True if cfg["data"].get("n_shards", 0) < 1 else False
@@ -664,9 +668,9 @@ def train(cfg_file: str) -> None:
 
     if not load_train_whole:
         sharded_iterator = ShardedEpochDatasetIterator(n_shards=cfg["data"]["n_shards"],
-                                                       percent_to_sample=cfg["data"].get("percent_to_sample_from_shard",
-                                                                                         1.0),
+                                                       percent_to_sample=cfg["data"].get("percent_to_sample_from_shard",1.0),
                                                        data_path=cfg["data"]["train"],
+                                                       shard_path=cfg["data"]["shard_path"], 
                                                        extensions=(cfg["data"]["src"], cfg["data"]["trg"]),
                                                        fields=(src_field, trg_field),
                                                        n_epochs=cfg["training"]["epochs"],
@@ -689,10 +693,10 @@ def train(cfg_file: str) -> None:
 
     # log all entries of config
     log_cfg(cfg, trainer.logger)
-
-    log_data_info(train_data=train_data, valid_data=dev_data,
-                  test_data=test_data, src_vocab=src_vocab, trg_vocab=trg_vocab,
-                  logging_function=trainer.logger.info)
+    if load_train_whole: 
+        log_data_info(train_data=train_data, valid_data=dev_data,
+                      test_data=test_data, src_vocab=src_vocab, trg_vocab=trg_vocab,
+                      logging_function=trainer.logger.info)
 
     trainer.logger.info(str(model))
 
